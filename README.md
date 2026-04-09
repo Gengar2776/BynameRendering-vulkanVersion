@@ -143,15 +143,7 @@ RightHandAnchor  →  RightHand Controller  →  RightHand
 LeftHandAnchor  →  LeftHand Controller  →  LeftHand
 ```
 
-To find the correct name for your specific game, run this logcat filter while the game is running and look for controller-related GameObjects:
 
-```bash
-adb logcat -s Unity | grep -i "hand\|controller\|anchor"
-```
-
-Or dump the scene hierarchy via a BNM hook on `Scene.GetRootGameObjects` and log all names.
-
-Once you find the right names, update the arrays in `SetupUnity()` inside `VRImGuiMenu.cpp`:
 
 ```cpp
 const char* rightNames[] = { "RightHandAnchor", "RightHand Controller", "RightHand" };
@@ -262,7 +254,7 @@ The raycast uses a plane intersection against the quad's world normal. If the ra
 
 **`LoadRawTextureData` / `Apply` not found**
 - Check your `dump.cs` for the exact method names and argument counts
-- Some Unity versions use `LoadRawTextureData(NativeArray<byte>)` instead — use the `(byte[], int)` overload
+- Some Unity versions use `LoadRawTextureData(NativeArray<byte>)` instead — use the `(byte[], int)`
 
 **Crash on `object_new`**
 - BNM must be fully initialised before `SetupUnity()` runs
@@ -298,6 +290,7 @@ Unity's Vulkan context is completely unaffected.
 
 ## Credits
 
-- [BNM (ByNameModding)](https://github.com/ByNameModding/BNM-Android) — IL2CPP runtime hooking
+- [BNM (ByNameModding)](https://github.com/ByNameModding/BNM-Android) — IL2CPP runtime hooking 
 - [Dear ImGui](https://github.com/ocornut/imgui) — immediate mode UI
-- [XRInput by Pubert-CS](https://github.com/Pubert-CS/Il2CppAPI-XRInput) — XR controller input API
+- [XRInput by Pubert-CS](https://github.com/Pubert-CS/Il2CppAPI-XRInput) — XR controller input API (goat 🥹)
+livku i dont feel like going to his repo(goat )
