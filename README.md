@@ -1,1 +1,303 @@
 # BynameRendering-vulkanVersion
+
+
+# VR ImGui Menu — Quest / Unity IL2CPP
+
+A native C++ mod menu that renders a [Dear ImGui](https://github.com/ocornut/imgui) panel onto a world-space quad attached to the right-hand controller, with left-hand raycasting for interaction. Works on **Vulkan-backed Unity games** (all modern Quest titles) without touching Vulkan at all.
+
+---
+
+## How It Works
+
+Modern Quest Unity games use Vulkan exclusively. The trick here is to **never fight the Vulkan context** — instead we:
+
+1. Create our own isolated **GLES3 EGL context** (a 1×1 pbuffer, completely separate from Unity's renderer)
+2. Render the ImGui panel into a **GLES framebuffer**
+3. Read the pixels back to CPU via `glReadPixels`
+4. Push those pixels to a Unity `Texture2D` every frame via `LoadRawTextureData` + `Apply`
+5. Unity handles uploading that texture through its own Vulkan pipeline onto a world-space quad
+
+```
+Your EGL context (GLES3)
+    └─ ImGui renders → FBO → glReadPixels → CPU buffer (512×512 RGBA)
+
+Unity's Vulkan context
+    └─ Texture2D.LoadRawTextureData(buffer) → Apply() → quad material → controller
+```
+
+No Vulkan code. No VkImage. No render pass setup.
+
+---
+
+
+**Libraries needed:**
+- [BNM (ByNameModding)](https://github.com/ByNameModding/BNM-Android) — IL2CPP method resolution + hooking
+- [Dear ImGui](https://github.com/ocornut/imgui) — with `imgui_impl_opengl3` backend
+- [XRInput (Pubert-CS)](https://github.com/Pubert-CS/Il2CppAPI-XRInput) — controller input
+- Dobby or bhook — for hooking Unity's `Update` loop
+
+---
+
+## Project Structure
+
+```
+app/src/main/cpp/
+├── include/
+│   └── Main/
+│       ├── VRImGuiMenu.h
+│       └── VRImGuiMenu.cpp      ← the menu
+├── imGUI/
+│   ├── imgui.h / imgui.cpp
+│   ├── imgui_draw.cpp
+│   ├── imgui_widgets.cpp
+│   ├── imgui_tables.cpp
+│   ├── imgui_impl_opengl3.h
+│   └── imgui_impl_opengl3.cpp
+├── extern/
+│   └── (BNM, XRInput, Dobby headers)
+└── native-lib.cpp               ← JNI_OnLoad entry point
+```
+
+---
+
+## Step 1 — CMakeLists.txt
+
+Make sure your `CMakeLists.txt` links the required system libraries and includes ImGui sources:
+
+```cmake
+cmake_minimum_required(VERSION 3.22.1)
+project(GenMod)
+
+add_library(GenMod SHARED
+    native-lib.cpp
+    include/Main/VRImGuiMenu.cpp
+
+    # ImGui core
+    imGUI/imgui.cpp
+    imGUI/imgui_draw.cpp
+    imGUI/imgui_widgets.cpp
+    imGUI/imgui_tables.cpp
+    imguis vulkan.cpp i fgor what its called
+)
+
+target_include_directories(GenMod PRIVATE
+    include
+    imGUI
+    extern
+)
+
+target_link_libraries(GenMod
+    android
+    log
+    EGL          # for our isolated EGL context
+    GLESv3       # GLES3 rendering
+    # your BNM / Dobby link targets here
+)
+```
+
+> **Note:** You do NOT need to link `vulkan` — we deliberately avoid it.
+
+---
+
+## Step 2 — Hook Unity's Update
+
+In `native-lib.cpp`, hook into Unity's per-frame update using BNM so `VRMenu::onupdate()` is called every frame:
+
+```cpp
+#include "BNMIncludes.hpp"
+#include <BNM/Class.hpp>
+#include <BNM/Method.hpp>
+#include "include/Main/VRImGuiMenu.h"
+
+// Hook whichever MonoBehaviour Update drives your target game's main loop.
+// Common candidates: UnityEngine.MonoBehaviour::Update,
+//                   or a game-specific manager class from your dump.cs
+HOOK_METHOD(void, Update, (void* self)) {
+    Update_Original(self);
+    VRMenu::onupdate();
+}
+
+LOAD_METHOD(OnLoad) {
+    // Replace "YourGameManager" with a class from your dump.cs that has Update()
+    auto gameManager = BNM::Class("", "YourGameManager", BNM::Image("Assembly-CSharp.dll"));
+    sethook(gameManager.GetMethod("Update", 0), Update, Update_Original);
+    // sethook is my custom define
+}
+
+BNM_LOAD(OnLoad);
+```
+
+---
+
+## Step 3 — Controller Object Names
+
+The menu attaches to your right hand and raycasts from your left hand. It searches for these GameObjects by name in order:
+
+**Right hand:**
+```
+RightHandAnchor  →  RightHand Controller  →  RightHand
+```
+
+**Left hand:**
+```
+LeftHandAnchor  →  LeftHand Controller  →  LeftHand
+```
+
+To find the correct name for your specific game, run this logcat filter while the game is running and look for controller-related GameObjects:
+
+```bash
+adb logcat -s Unity | grep -i "hand\|controller\|anchor"
+```
+
+Or dump the scene hierarchy via a BNM hook on `Scene.GetRootGameObjects` and log all names.
+
+Once you find the right names, update the arrays in `SetupUnity()` inside `VRImGuiMenu.cpp`:
+
+```cpp
+const char* rightNames[] = { "RightHandAnchor", "RightHand Controller", "RightHand" };
+const char* leftNames[]  = { "LeftHandAnchor",  "LeftHand Controller",  "LeftHand"  };
+```
+
+---
+
+## Step 4 — Texture2D Constructor
+
+The menu creates a Unity `Texture2D` at runtime via IL2CPP. You need to verify the `.ctor` signature in your game's `dump.cs` (generated by [Il2CppDumper](https://github.com/Perfare/Il2CppDumper)):
+
+Search `dump.cs` for:
+```
+class Texture2D
+```
+
+Look for a constructor that takes `(int width, int height)` — it will look something like:
+```csharp
+public Texture2D(int width, int height) { }            // 2 args — use GetMethod(".ctor", 2)
+public Texture2D(int width, int height, TextureFormat) { } // 3 args — use GetMethod(".ctor", 3)
+```
+
+If your game only has the 3-arg version, update `SetupUnity()`:
+
+```cpp
+static BNM::Method<void> ctor = tex2DClass.GetMethod(".ctor", 3);
+// ...
+ctor.Call(g_unityTex, FBO_W, FBO_H, 4); // 4 = TextureFormat.RGBA32
+```
+
+---
+
+## Step 5 — Adding Your Menu UI
+
+All ImGui UI code goes inside `RenderAndReadback()` in `VRImGuiMenu.cpp`, between `ImGui::NewFrame()` and `ImGui::Render()`:
+
+```cpp
+ImGui::NewFrame();
+
+// ── Your UI ───────────────────────────────────────────────
+ImGui::Begin("My Mod Menu");
+
+if (ImGui::Button("God Mode")) {
+    // call your BNM hook here
+}
+
+ImGui::SliderFloat("Speed", &g_speed, 1.0f, 10.0f);
+ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+
+ImGui::End();
+// ──────────────────────────────────────────────────────────
+
+ImGui::Render();
+```
+
+---
+
+## Step 6 — Menu Position & Scale
+
+Adjust these constants at the top of `VRImGuiMenu.cpp` to reposition the quad relative to the right controller:
+
+```cpp
+static constexpr float MENU_X = 0.0f;   // left/right offset
+static constexpr float MENU_Y = 0.1f;   // up/down offset
+static constexpr float MENU_Z = 0.2f;   // forward offset (in front of hand)
+static constexpr float MENU_S = 0.3f;   // scale (0.3 = 30cm roughly)
+```
+
+And the render resolution (higher = sharper, more CPU cost on readback):
+
+```cpp
+static constexpr int FBO_W = 512;
+static constexpr int FBO_H = 512;
+```
+
+---
+
+## Interaction
+
+Input is driven by left-hand raycasting:
+
+| Action | Result |
+|--------|--------|
+| Point left controller at quad | Mouse cursor moves in ImGui |
+| Left trigger | ImGui left click |
+| Left trigger (on click) | Haptic pulse (0.3 amplitude, 50ms) |
+
+The raycast uses a plane intersection against the quad's world normal. If the ray misses the quad, `MousePos` is set to `(-1, -1)` which tells ImGui no cursor is present.
+
+---
+
+## Troubleshooting
+
+**Menu doesn't appear**
+- Check logcat for `VRMenu` tag: `adb logcat -s VRMenu`
+- Most common cause: hand GameObject names don't match. See Step 3.
+
+**Colours look wrong (red/blue swapped)**
+- Change `TextureFormat` from `4` (RGBA32) to `7` (BGRA32) in the `ctor.Call` line
+
+**Menu appears but is upside down**
+- The row-flip in `RenderAndReadback()` should handle this. If it's still flipped, negate `v` in the UV calculation: change `(1.0f - v)` to `v`
+
+**EGL context fails to create**
+- Verify `GLESv3` and `EGL` are in your `target_link_libraries`
+- Quest 2/3 both support GLES3 even when the game uses Vulkan
+
+**`LoadRawTextureData` / `Apply` not found**
+- Check your `dump.cs` for the exact method names and argument counts
+- Some Unity versions use `LoadRawTextureData(NativeArray<byte>)` instead — use the `(byte[], int)` overload
+
+**Crash on `object_new`**
+- BNM must be fully initialised before `SetupUnity()` runs
+- Make sure your `OnLoad` hook fires before any `onupdate()` calls reach `SetupUnity`
+
+---
+
+## How the EGL Isolation Works
+
+This is the core trick that makes the whole thing possible on a Vulkan game:
+
+```cpp
+// We create a 1×1 pbuffer surface — size doesn't matter since
+// we only ever render to our own FBO, never to this surface directly
+const EGLint surfaceAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+g_eglSurface = eglCreatePbufferSurface(g_eglDisplay, config, surfaceAttribs);
+
+// Isolated context — EGL_NO_CONTEXT means no sharing with Unity
+g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+```
+
+Every frame we make it current only for the duration of the render + readback, then immediately release it:
+
+```cpp
+eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+// ... render ImGui, glReadPixels ...
+eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+```
+
+Unity's Vulkan context is completely unaffected.
+
+---
+
+## Credits
+
+- [BNM (ByNameModding)](https://github.com/ByNameModding/BNM-Android) — IL2CPP runtime hooking
+- [Dear ImGui](https://github.com/ocornut/imgui) — immediate mode UI
+- [XRInput by Pubert-CS](https://github.com/Pubert-CS/Il2CppAPI-XRInput) — XR controller input API
